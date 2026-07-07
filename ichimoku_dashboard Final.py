@@ -139,6 +139,7 @@ def ichimoku(df):
     return pd.DataFrame({
         "tenkan": tenkan, "kijun": kijun,
         "cloud_top": np.maximum(senA, senB),
+        "cloud_bot": np.minimum(senA, senB),
     }, index=df.index)
 
 
@@ -159,7 +160,7 @@ def adx(df, period=14):
     return dx.ewm(alpha=1/period, adjust=False).mean()
 
 # ─── SIGNALS ──────────────────────────────────────────────────────────────────
-def condition_matrix(df, adx_min, clean_margin, i=None):
+def condition_matrix(df, adx_min, clean_margin, direction="long", i=None):
     """Evaluate the 7 entry conditions at bar i (default: last bar)."""
     ichi = ichimoku(df)
     adx_s = adx(df, ADX_PERIOD)
@@ -169,28 +170,47 @@ def condition_matrix(df, adx_min, clean_margin, i=None):
         return None
     o, h, l, c = (df["Open"].iloc[i], df["High"].iloc[i],
                   df["Low"].iloc[i],  df["Close"].iloc[i])
-    prev_high = df["High"].iloc[i - CHIKOU_SHIFT]
     t, k = ichi["tenkan"].iloc[i], ichi["kijun"].iloc[i]
-    vals = [t, k, ichi["tenkan"].iloc[i-SLOPE_LOOKBACK],
-            ichi["kijun"].iloc[i-SLOPE_LOOKBACK],
-            adx_s.iloc[i], prev_high, ichi["cloud_top"].iloc[i]]
+    t_prev = ichi["tenkan"].iloc[i-SLOPE_LOOKBACK]
+    k_prev = ichi["kijun"].iloc[i-SLOPE_LOOKBACK]
+    if direction == "long":
+        ref = df["High"].iloc[i - CHIKOU_SHIFT]   # chikou breaks above past high
+        cloud_ref = ichi["cloud_top"].iloc[i]
+    else:
+        ref = df["Low"].iloc[i - CHIKOU_SHIFT]    # chikou breaks below past low
+        cloud_ref = ichi["cloud_bot"].iloc[i]
+    vals = [t, k, t_prev, k_prev, adx_s.iloc[i], ref, cloud_ref]
     if any(pd.isna(v) for v in vals):
         return None
     rng = h - l
-    return {
-        "TK > KJ":        bool(t > k),
-        "Tenkan rising":  bool(t > ichi["tenkan"].iloc[i-SLOPE_LOOKBACK]),
-        "Kijun rising":   bool(k > ichi["kijun"].iloc[i-SLOPE_LOOKBACK]),
-        "Chikou breakout": bool(c > prev_high),
-        "Clean breakout": bool(c > prev_high * (1 + clean_margin)
-                               and c > o and rng > 0 and c >= (h + l) / 2),
-        f"ADX ≥ {adx_min:g}": bool(adx_s.iloc[i] >= adx_min),
-        "In/below cloud": bool(c <= ichi["cloud_top"].iloc[i]),
-        "_close": float(c), "_adx": float(adx_s.iloc[i]),
-    }
+    if direction == "long":
+        conds = {
+            "TK > KJ":        bool(t > k),
+            "Tenkan rising":  bool(t > t_prev),
+            "Kijun rising":   bool(k > k_prev),
+            "Chikou breakout": bool(c > ref),
+            "Clean break": bool(c > ref * (1 + clean_margin)
+                                and c > o and rng > 0 and c >= (h + l) / 2),
+            f"ADX ≥ {adx_min:g}": bool(adx_s.iloc[i] >= adx_min),
+            "In/below cloud": bool(c <= cloud_ref),
+        }
+    else:
+        conds = {
+            "TK > KJ":        bool(t < k),           # mirrored: TK < KJ
+            "Tenkan rising":  bool(t < t_prev),      # mirrored: falling
+            "Kijun rising":   bool(k < k_prev),      # mirrored: falling
+            "Chikou breakout": bool(c < ref),        # breakdown
+            "Clean break": bool(c < ref * (1 - clean_margin)
+                                and c < o and rng > 0 and c <= (h + l) / 2),
+            f"ADX ≥ {adx_min:g}": bool(adx_s.iloc[i] >= adx_min),
+            "In/below cloud": bool(c >= cloud_ref),  # mirrored: in/above
+        }
+    conds["_close"] = float(c)
+    conds["_adx"] = float(adx_s.iloc[i])
+    return conds
 
 
-def find_signals(ticker, df, adx_min, clean_margin):
+def find_signals(ticker, df, adx_min, clean_margin, direction="long"):
     if df is None or len(df) < MIN_BARS:
         return []
     df = df.sort_index()
@@ -199,60 +219,89 @@ def find_signals(ticker, df, adx_min, clean_margin):
     o, c = df["Open"].values, df["Close"].values
     h, l = df["High"].values, df["Low"].values
     tenkan, kijun = ichi["tenkan"].values, ichi["kijun"].values
-    cloud_top = ichi["cloud_top"].values
+    cloud_top, cloud_bot = ichi["cloud_top"].values, ichi["cloud_bot"].values
     adx_v, dates = adx_s.values, df.index
     events = []
     start = 52 + CHIKOU_SHIFT + max(SLOPE_LOOKBACK, SWING_LOOKBACK, ADX_PERIOD) + 2
     n = len(df)
     for i in range(start, n):
-        vals = [tenkan[i], kijun[i], tenkan[i-SLOPE_LOOKBACK], kijun[i-SLOPE_LOOKBACK],
-                adx_v[i], o[i], h[i], l[i], c[i], h[i-CHIKOU_SHIFT], cloud_top[i]]
+        ref = h[i-CHIKOU_SHIFT] if direction == "long" else l[i-CHIKOU_SHIFT]
+        cref = cloud_top[i] if direction == "long" else cloud_bot[i]
+        vals = [tenkan[i], kijun[i], tenkan[i-SLOPE_LOOKBACK],
+                kijun[i-SLOPE_LOOKBACK], adx_v[i],
+                o[i], h[i], l[i], c[i], ref, cref]
         if any(np.isnan(v) for v in vals):
             continue
         rng = h[i] - l[i]
-        ok = (tenkan[i] > kijun[i]
-              and tenkan[i] > tenkan[i-SLOPE_LOOKBACK]
-              and kijun[i]  > kijun[i-SLOPE_LOOKBACK]
-              and c[i] > h[i-CHIKOU_SHIFT] * (1 + clean_margin)
-              and c[i] > o[i] and rng > 0 and c[i] >= (h[i] + l[i]) / 2
-              and adx_v[i] >= adx_min
-              and c[i] <= cloud_top[i])
+        if direction == "long":
+            ok = (tenkan[i] > kijun[i]
+                  and tenkan[i] > tenkan[i-SLOPE_LOOKBACK]
+                  and kijun[i]  > kijun[i-SLOPE_LOOKBACK]
+                  and c[i] > ref * (1 + clean_margin)
+                  and c[i] > o[i] and rng > 0 and c[i] >= (h[i] + l[i]) / 2
+                  and adx_v[i] >= adx_min
+                  and c[i] <= cref)
+        else:
+            ok = (tenkan[i] < kijun[i]
+                  and tenkan[i] < tenkan[i-SLOPE_LOOKBACK]
+                  and kijun[i]  < kijun[i-SLOPE_LOOKBACK]
+                  and c[i] < ref * (1 - clean_margin)
+                  and c[i] < o[i] and rng > 0 and c[i] <= (h[i] + l[i]) / 2
+                  and adx_v[i] >= adx_min
+                  and c[i] >= cref)
         if not ok:
             continue
         entry = c[i]
-        stop = np.min(l[i-SWING_LOOKBACK:i+1]) * (1 - STOP_BUFFER)
-        risk = entry - stop
+        if direction == "long":
+            stop = np.min(l[i-SWING_LOOKBACK:i+1]) * (1 - STOP_BUFFER)
+            risk = entry - stop
+            tp1 = entry + PARTIAL_RR * risk
+        else:
+            stop = np.max(h[i-SWING_LOOKBACK:i+1]) * (1 + STOP_BUFFER)
+            risk = stop - entry
+            tp1 = entry - PARTIAL_RR * risk
         if risk <= 0:
             continue
         events.append({
-            "ticker": ticker, "entry_idx": i, "entry_date": dates[i],
+            "ticker": ticker, "direction": direction,
+            "entry_idx": i, "entry_date": dates[i],
             "entry_price": entry, "init_stop": stop,
-            "tp1": entry + PARTIAL_RR * risk, "risk_per_share": risk,
-            "_close": c, "_high": h, "_kijun": kijun, "_dates": dates, "_n": n,
+            "tp1": tp1, "risk_per_share": risk,
+            "_close": c, "_high": h, "_low": l, "_kijun": kijun,
+            "_dates": dates, "_n": n,
         })
     return events
 
 
 def simulate_trade(e, shares):
-    close, high, kijun, dates = e["_close"], e["_high"], e["_kijun"], e["_dates"]
+    close, high, low = e["_close"], e["_high"], e["_low"]
+    kijun, dates = e["_kijun"], e["_dates"]
     n, i0 = e["_n"], e["entry_idx"]
     tp1, stop = e["tp1"], e["init_stop"]
+    is_long = e["direction"] == "long"
     sh1 = int(shares * PARTIAL_FRACTION)
     sh2 = shares - sh1
     hit_11, legs = False, []
     for t in range(i0 + 1, n):
         if not hit_11:
-            if close[t] < stop:
+            stopped = close[t] < stop if is_long else close[t] > stop
+            if stopped:
                 return {"exit_date": dates[t],
                         "legs": [(close[t], dates[t], "stop", shares)]}
-            if high[t] >= tp1:
+            reached = high[t] >= tp1 if is_long else low[t] <= tp1
+            if reached:
                 hit_11 = True
                 legs.append((tp1, dates[t], "tp1_partial", sh1))
                 if sh2 <= 0:
                     return {"exit_date": dates[t], "legs": legs}
                 continue
         else:
-            if not np.isnan(kijun[t]) and close[t] < kijun[t] * (1 - KIJUN_TRAIL_BUFFER):
+            if np.isnan(kijun[t]):
+                continue
+            trail_hit = (close[t] < kijun[t] * (1 - KIJUN_TRAIL_BUFFER)
+                         if is_long else
+                         close[t] > kijun[t] * (1 + KIJUN_TRAIL_BUFFER))
+            if trail_hit:
                 legs.append((close[t], dates[t], "kijun_trail", sh2))
                 return {"exit_date": dates[t], "legs": legs}
     if not hit_11:
@@ -270,7 +319,7 @@ def run_backtest(all_events):
         still = []
         for p in open_positions:
             if p["exit_date"] <= ed:
-                cash += p["shares"] * p["exit_price"]
+                cash += p["_exit_value"]
                 closed.append(p)
             else:
                 still.append(p)
@@ -280,26 +329,34 @@ def run_backtest(all_events):
         shares = int(POSITION_SIZE // e["entry_price"])
         if shares <= 0:
             continue
-        cost = shares * e["entry_price"]
+        cost = shares * e["entry_price"]     # long: cost basis | short: margin reserved
         cash -= cost
         sim = simulate_trade(e, shares)
         legs, exit_date = sim["legs"], sim["exit_date"]
-        proceeds = sum(px * sh for px, _, _, sh in legs)
-        pnl = proceeds - e["entry_price"] * shares
-        avg_exit = proceeds / shares
+        is_long = e["direction"] == "long"
+        if is_long:
+            proceeds = sum(px * sh for px, _, _, sh in legs)
+            pnl = proceeds - cost
+        else:
+            pnl = sum((e["entry_price"] - px) * sh for px, _, _, sh in legs)
+        avg_exit = sum(px * sh for px, _, _, sh in legs) / shares
         hold_hrs = (exit_date - ed).total_seconds() / 3600
         open_positions.append({
-            "ticker": e["ticker"], "entry_date": ed,
+            "ticker": e["ticker"], "direction": e["direction"],
+            "entry_date": ed,
             "entry_price": round(e["entry_price"], 2), "shares": shares,
             "stop_loss": round(e["init_stop"], 2),
             "tp1_level": round(e["tp1"], 2),
             "exit_date": exit_date, "exit_price": round(avg_exit, 2),
             "exit_reason": "+".join(r for _, _, r, _ in legs),
             "pnl": round(pnl, 2),
-            "return_%": round((proceeds / cost - 1) * 100, 2),
+            "return_%": round(pnl / cost * 100, 2),
             "hold_hours": round(hold_hrs, 1),
+            "_exit_value": cost + pnl,
         })
     closed.extend(open_positions)
+    for p in closed:
+        p.pop("_exit_value", None)
     return closed
 
 # ─── DATA (cached) ────────────────────────────────────────────────────────────
@@ -395,6 +452,11 @@ st.sidebar.caption("Chikou breakout · inside/below cloud")
 tf_label = st.sidebar.selectbox("Timeframe", list(TIMEFRAMES.keys()), index=1)
 interval, max_days, resample_rule = TIMEFRAMES[tf_label]
 
+dir_choice = st.sidebar.radio("Direction", ["Long", "Short", "Both"],
+                              index=0, horizontal=True)
+DIRECTIONS = {"Long": ["long"], "Short": ["short"],
+              "Both": ["long", "short"]}[dir_choice]
+
 today = datetime.now(timezone.utc).date()
 earliest = today - timedelta(days=max_days)
 picked = st.sidebar.date_input(
@@ -434,7 +496,7 @@ if auto_refresh:
 
 # ─── MAIN (auto-runs — no button needed) ─────────────────────────────────────
 st.title("Ichimoku Chikou Breakout v2 — Live Dashboard")
-st.caption(f"**{tf_label}** · {date_from} → {date_to} · cap ≥ ${min_cap}B · "
+st.caption(f"**{tf_label}** · **{dir_choice}** · {date_from} → {date_to} · cap ≥ ${min_cap}B · "
            f"ADX ≥ {adx_min} · margin {clean_margin*100:.1f}% · "
            f"updated {datetime.now().strftime('%H:%M:%S')}")
 
@@ -470,25 +532,35 @@ tab_screener, tab_backtest = st.tabs(["🔴 Live Screener", "📊 Backtest"])
 
 # ─── TAB 1: LIVE SCREENER ─────────────────────────────────────────────────────
 with tab_screener:
-    st.subheader(f"Signals on the latest {tf_label} bar")
+    st.subheader(f"Signals on the latest {tf_label} bar — {dir_choice.lower()}")
+    # display names per direction (mirrored conditions for shorts)
+    LABELS = {
+        "long":  ["TK > KJ", "Tenkan rising", "Kijun rising", "Chikou breakout",
+                  "Clean break", "ADX", "In/below cloud"],
+        "short": ["TK < KJ", "Tenkan falling", "Kijun falling", "Chikou breakdown",
+                  "Clean break", "ADX", "In/above cloud"],
+    }
     rows, near_rows = [], []
     for tk, df in price_map.items():
-        try:
-            cm = condition_matrix(df, adx_min, clean_margin)
-        except Exception:
-            continue
-        if cm is None:
-            continue
-        conds = {k: v for k, v in cm.items() if not k.startswith("_")}
-        passed = sum(conds.values())
-        row = {"Ticker": tk, "Cap $B": round(cap_lookup.get(tk, 0), 1),
-               "Close": round(cm["_close"], 2), "ADX": round(cm["_adx"], 1),
-               **{k: ("✅" if v else "—") for k, v in conds.items()},
-               "Passed": f"{passed}/7"}
-        if passed == 7:
-            rows.append(row)
-        elif passed >= 5:
-            near_rows.append(row)
+        for d in DIRECTIONS:
+            try:
+                cm = condition_matrix(df, adx_min, clean_margin, direction=d)
+            except Exception:
+                continue
+            if cm is None:
+                continue
+            conds = [v for k, v in cm.items() if not k.startswith("_")]
+            passed = sum(conds)
+            row = {"Ticker": tk, "Dir": "🟢 LONG" if d == "long" else "🔴 SHORT",
+                   "Cap $B": round(cap_lookup.get(tk, 0), 1),
+                   "Close": round(cm["_close"], 2), "ADX": round(cm["_adx"], 1),
+                   **{lbl: ("✅" if v else "—")
+                      for lbl, v in zip(LABELS[d], conds)},
+                   "Passed": f"{passed}/7"}
+            if passed == 7:
+                rows.append(row)
+            elif passed >= 5:
+                near_rows.append(row)
 
     c1, c2 = st.columns(2)
     c1.metric("🔥 Full signals now", len(rows))
@@ -512,10 +584,12 @@ with tab_backtest:
     with st.spinner("Generating signals & simulating portfolio ..."):
         all_events = []
         for tk, df in price_map.items():
-            try:
-                all_events.extend(find_signals(tk, df, adx_min, clean_margin))
-            except Exception:
-                continue
+            for d in DIRECTIONS:
+                try:
+                    all_events.extend(find_signals(tk, df, adx_min,
+                                                   clean_margin, direction=d))
+                except Exception:
+                    continue
         lo = pd.Timestamp(date_from, tz="UTC")
         hi = pd.Timestamp(date_to, tz="UTC") + pd.Timedelta(days=1)
         all_events = [e for e in all_events if lo <= e["entry_date"] < hi]
@@ -546,6 +620,16 @@ with tab_backtest:
         m[4].metric("Expectancy", f"${tdf['pnl'].mean():,.0f}")
         m[5].metric("Max drawdown", f"{eq['dd_pct'].min():.2f}%")
 
+        if dir_choice == "Both" and tdf["direction"].nunique() > 1:
+            s = st.columns(2)
+            for col, d, icon in [(s[0], "long", "🟢"), (s[1], "short", "🔴")]:
+                sub = tdf[tdf["direction"] == d]
+                if len(sub):
+                    wr = (sub["pnl"] > 0).mean() * 100
+                    col.metric(f"{icon} {d.capitalize()} side",
+                               f"${sub['pnl'].sum():,.0f}",
+                               f"{len(sub)} trades · {wr:.0f}% win")
+
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=eq["exit_date"], y=eq["equity"], mode="lines",
                                  name="Equity", line=dict(width=2, color="#2dd4a7")))
@@ -558,8 +642,9 @@ with tab_backtest:
         cA, cB = st.columns([1, 2])
         with cA:
             st.markdown("**Exit breakdown**")
-            br = tdf.groupby("exit_reason")["pnl"].agg(["count", "sum"]).reset_index()
-            br.columns = ["Exit path", "Trades", "P&L $"]
+            br = (tdf.groupby(["direction", "exit_reason"])["pnl"]
+                     .agg(["count", "sum"]).reset_index())
+            br.columns = ["Dir", "Exit path", "Trades", "P&L $"]
             st.dataframe(br, use_container_width=True, hide_index=True)
         with cB:
             st.markdown("**P&L by month**")
@@ -580,5 +665,5 @@ with tab_backtest:
         st.dataframe(show, use_container_width=True, hide_index=True, height=420)
         st.download_button("⬇ Download trades CSV",
                            show.to_csv(index=False).encode(),
-                           file_name=f"ichimoku_v2_{tf_label.replace(' ','')}_trades.csv",
+                           file_name=f"ichimoku_v2_{tf_label.replace(' ','')}_{dir_choice.lower()}_trades.csv",
                            mime="text/csv")
